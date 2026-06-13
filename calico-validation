@@ -1,0 +1,68 @@
+echo "=== Cross-Node Communication Test (Fixed) ==="
+
+# Deploy nginx with anti-affinity to spread across nodes
+kubectl create deployment nginx-test --image=nginx --replicas=3
+kubectl wait --for=condition=ready pod -l app=nginx-test --timeout=120s
+kubectl get pods -l app=nginx-test -o wide
+
+# Get all pod IPs
+PODS=($(kubectl get pods -l app=nginx-test -o jsonpath='{.items[*].metadata.name}'))
+IPS=($(kubectl get pods -l app=nginx-test -o jsonpath='{.items[*].status.podIP}'))
+NODES=($(kubectl get pods -l app=nginx-test -o jsonpath='{.items[*].spec.nodeName}'))
+
+echo
+echo "Pods deployed:"
+for i in 0 1 2; do
+  echo "  [${i}] ${PODS[$i]} on ${NODES[$i]} → ${IPS[$i]}"
+done
+
+# Use first pod as source, test connectivity to ALL pods
+SOURCE_POD=${PODS[0]}
+SOURCE_NODE=${NODES[0]}
+
+echo
+echo "Source: $SOURCE_POD (on $SOURCE_NODE)"
+echo
+
+# Test against all 3 pod IPs
+for i in 0 1 2; do
+  TARGET_IP=${IPS[$i]}
+  TARGET_NODE=${NODES[$i]}
+
+  if [ "$SOURCE_NODE" == "$TARGET_NODE" ]; then
+    LABEL="SAME-NODE  ($SOURCE_NODE → $TARGET_NODE)"
+  else
+    LABEL="CROSS-NODE ($SOURCE_NODE → $TARGET_NODE)"
+  fi
+
+  RESULT=$(kubectl exec $SOURCE_POD -- curl -s -o /dev/null -w "%{http_code}" -m 5 http://$TARGET_IP 2>/dev/null)
+
+  if [ "$RESULT" == "200" ]; then
+    echo "  ✅ $LABEL → HTTP $RESULT"
+  else
+    echo "  ❌ $LABEL → FAILED (got: $RESULT)"
+  fi
+done
+
+echo
+echo "=== Test 2: Service ClusterIP ==="
+kubectl expose deployment nginx-test --port=80 --name=nginx-svc 2>/dev/null
+sleep 3
+SVC_IP=$(kubectl get svc nginx-svc -o jsonpath='{.spec.clusterIP}')
+echo "Service ClusterIP: $SVC_IP"
+
+# Curl 5 times to see load balancing
+echo "Curling service 5 times (should hit different pods):"
+for i in 1 2 3 4 5; do
+  RESULT=$(kubectl exec $SOURCE_POD -- curl -s -o /dev/null -w "%{http_code}" -m 3 http://$SVC_IP)
+  echo "  Attempt $i: HTTP $RESULT"
+done
+
+echo
+echo "=== Test 3: DNS Resolution ==="
+kubectl exec $SOURCE_POD -- nslookup nginx-svc 2>&1 | head -5
+
+echo
+echo "=== Cleanup ==="
+kubectl delete deployment nginx-test
+kubectl delete svc nginx-svc
